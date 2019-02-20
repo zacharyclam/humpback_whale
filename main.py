@@ -12,9 +12,8 @@ from keras.engine.topology import Input
 from keras.layers import Activation, Add, BatchNormalization, Concatenate, Conv2D, Dense, Flatten, \
     GlobalMaxPooling2D, Lambda, MaxPooling2D, Reshape
 from keras.models import Model
-from keras_tqdm import TQDMNotebookCallback
 
-import gc
+import threading
 import os
 import tensorflow as tf
 import numpy as np
@@ -38,18 +37,16 @@ from keras.callbacks import ModelCheckpoint
 
 
 # 指定使用显卡
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
-
-# config = tf.ConfigProto()
-# config.gpu_options.per_process_gpu_memory_fraction = 0.90  # 占用GPU90%的显存
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+#
+# # config = tf.ConfigProto()
+# # config.gpu_options.per_process_gpu_memory_fraction = 0.90  # 占用GPU90%的显存
 gpu_options = tf.GPUOptions(allow_growth=True)
 K.set_session(tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)))
 
 tagged = dict([(p, w) for _, p, w in read_csv('./data/train.csv').to_records()])
-tagged_playground = dict([(p, w) for _, p, w in read_csv('./data2/train.csv').to_records()])
-submit = [p for _, p, _ in read_csv('./data/sample_submission.csv').to_records()] + \
-         [p for _, p, _ in read_csv('./data2/sample_submission.csv').to_records()]
-tagged = {**tagged_playground, **tagged}
+submit = [p for _, p, _ in read_csv('./data/sample_submission.csv').to_records()]
+# tagged = {**tagged_playground, **tagged}
 
 join = list(tagged.keys()) + submit
 
@@ -57,8 +54,6 @@ new_whale = 'new_whale'
 def expand_path(p):
     if isfile('./data/train/' + p): return './data/train/' + p
     if isfile('./data/test/' + p): return './data/test/' + p
-    if isfile('./data2/train/' + p): return './data2/train/' + p
-    if isfile('./data2/test/' + p): return './data2/test/' + p
     return p
 
 
@@ -243,9 +238,10 @@ def read_cropped_image(p, augment):
     img = img_to_array(img)
 
     # Apply affine transformation
-    matrix = trans[:2, :2]
-    offset = trans[:2, 2]
+    matrix = trans[:2, :2]      # (2, 2)
+    offset = trans[:2, 2]       # (2,)
     img = img.reshape(img.shape[:-1])
+    # affine_transform(原图像， 旋转矩阵， 平移矩阵)  np.dot(matrix, o) + offset
     img = affine_transform(img, matrix, offset, output_shape=img_shape[:-1], order=1, mode='constant',
                            cval=np.average(img))
     img = img.reshape(img_shape)
@@ -281,6 +277,9 @@ def subblock(x, filter, **kwargs):
     y = Activation('relu')(y)
     return y
 
+
+def build_branch_model(lr, l2, activation='sigmoid'):
+    pass
 
 def build_model(lr, l2, activation='sigmoid'):
     ##############
@@ -359,7 +358,7 @@ def build_model(lr, l2, activation='sigmoid'):
     return model, branch_model, head_model
 
 
-model, branch_model, head_model = build_model(64e-5, 0)
+model, branch_model, head_model = build_model(64e-5, 2.1e-4)
 
 
 with open('./data/exclude.txt', 'rt') as f:
@@ -441,8 +440,8 @@ for i, t in enumerate(train): t2i[t] = i
 # As a workaround, use scipy with data partitioning.
 # Because algorithm is O(n^3), small partitions are much faster, but not what produced the submitted solution
 try:
-    from lap import lapjv
-
+    # from lap import lapjv
+    from lapjv import lapjv
     segment = False
 except ImportError:
     print('Module lap not found, emulating with much slower scipy.optimize.linear_sum_assignment')
@@ -487,24 +486,45 @@ class TrainingData(Sequence):
             j += 1
         return [a, b], c
 
+    def compute_LAP(self):
+        num_threads = 6
+        tmp = num_threads * [None]
+        threads = []
+        thread_input = num_threads * [None]
+        thread_idx = 0
+        batch = self.score.shape[0] // (num_threads - 1)
+        for start in range(0, self.score.shape[0], batch):
+            end = min(self.score.shape[0], start + batch)
+            thread_input[thread_idx] = self.score[start:end, start:end]
+            thread_idx += 1
+
+        def worker(data_idx):
+            x, _, _ = lapjv(thread_input[data_idx])
+            tmp[data_idx] = x
+
+        # print("Start worker threads")
+        for i in range(num_threads):
+            t = threading.Thread(target=worker, args=(i,), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            if t is not None:
+                t.join()
+        x = np.concatenate(tmp)
+        # print("LAP completed")
+        return x
+
     def on_epoch_end(self):
         if self.steps <= 0: return  # Skip this on the last epoch.
         self.steps -= 1
         self.match = []
         self.unmatch = []
-        if segment:
-            # Using slow scipy. Make small batches.
-            # Because algorithm is O(n^3), small batches are much faster.
-            # However, this does not find the real optimum, just an approximation.
-            tmp = []
-            batch = 512
-            for start in range(0, score.shape[0], batch):
-                end = min(score.shape[0], start + batch)
-                _, x = linear_sum_assignment(self.score[start:end, start:end])
-                tmp.append(x + start)
-            x = np.concatenate(tmp)
-        else:
-            _, _, x = lapjv(self.score)  # Solve the linear assignment problem
+
+        # compute x
+        # _, _, x = lapjv(self.score)  # Solve the linear assignment problem
+        x = self.compute_LAP()
+
+
         y = np.arange(len(x), dtype=np.int32)
 
         # Compute a derangement for matching whales
@@ -634,8 +654,8 @@ def compute_score(verbose=1):
     score = score_reshape(score, features)
     return features, score
 
-checkpoint = ModelCheckpoint(filepath="./data/model_playground/checkpoint-{epoch:05d}-{loss:.3f}.h5",
-                             monitor='loss',mode='min', period=1, verbose=2, save_best_only=True)
+checkpoint = ModelCheckpoint(filepath="./data/model_jky/checkpoint-{epoch:05d}-{loss:.3f}.h5",
+                             monitor='loss',mode='min', period=1, verbose=2)
 
 
 def make_steps(step, ampl):
@@ -680,52 +700,64 @@ def make_steps(step, ampl):
 
 model_name = 'mpiotte-standard'
 histories = []
-steps = 0
-#
-# def train():
-#     global model
-# if isfile('./data/model/checkpoint-00046-0.066.h5'):
-#     tmp = keras.models.load_model('./data/model/checkpoint-00046-0.066.h5')
-#     model.set_weights(tmp.get_weights())
-#     print("load weight")
-# else:
-#     print("load fail")
+steps = 600
+
+if isfile('./data/model_jky/checkpoint-00605-0.022.h5'):
+    tmp = keras.models.load_model('./data/model_jky/checkpoint-00605-0.022.h5')
+    model.set_weights(tmp.get_weights())
+    print("load weight")
+else:
+    print("load fail")
 
 # epoch -> 10
-make_steps(10, 1000)
-ampl = 100.0
-for _ in range(10):
-    print('noise ampl.  = ', ampl)
-make_steps(5, 30)
-make_steps(5, ampl)
-ampl = max(1.0, 100 ** -0.1 * ampl)
-# epoch -> 150
-for _ in range(18): make_steps(5, 1.0)
-# epoch -> 200
-set_lr(model, 16e-5)
-for _ in range(10): make_steps(5, 0.5)
-# epoch -> 240
-set_lr(model, 4e-5)
-for _ in range(8): make_steps(5, 0.25)
+# make_steps(10, 1000)
+# ampl = 100.0
+# for _ in range(10):
+#     print('noise ampl.  = ', ampl)
+# make_steps(5, 30)
+# # make_steps(2, 1.0)
+# ampl = max(1.0, 100 ** -0.1 * ampl)
+# # epoch -> 150
+# for _ in range(18): make_steps(5, 1.0)
+# # epoch -> 200
+# set_lr(model, 16e-5)
+# for _ in range(10): make_steps(5, 0.5)
+# # epoch -> 240
+# set_lr(model, 4e-5)
+# for _ in range(8): make_steps(5, 0.25)
 # epoch -> 250
-set_lr(model, 1e-5)
-for _ in range(2): make_steps(5, 0.25)
-# epoch -> 300
-weights = model.get_weights()
-model, branch_model, head_model = build_model(64e-5, 0.0002)
-model.set_weights(weights)
-for _ in range(10): make_steps(5, 1.0)
-# epoch -> 350
-set_lr(model, 16e-5)
-for _ in range(10): make_steps(5, 0.5)
-# epoch -> 390
-set_lr(model, 4e-5)
-for _ in range(8): make_steps(5, 0.25)
+# set_lr(model, 1e-5)
+# for _ in range(2): make_steps(5, 0.25)
+# # epoch -> 300
+# weights = model.get_weights()
+# model, branch_model, head_model = build_model(64e-5, 0.0002)
+# model.set_weights(weights)
+# for _ in range(10): make_steps(5, 1.0)
+# # epoch -> 350
+# set_lr(model, 16e-5)
+# for _ in range(10): make_steps(5, 0.5)
+# # epoch -> 390
+# set_lr(model, 4e-5)
+# for _ in range(8): make_steps(5, 0.25)
 # epoch -> 400
+
+# epoch -> 550
+# set_lr(model, 1e-5)
+# make_steps(5, 1000)
+# make_steps(5, 100)
+# make_steps(5, 1)
+# make_steps(5, 0.5)
+# for _ in range(10): make_steps(5, 0.20)
+# set_lr(model, 5e-6)
+# for _ in range(10): make_steps(5, 0.15)
+
 set_lr(model, 1e-5)
-for _ in range(2): make_steps(5, 0.25)
+for _ in range(10): make_steps(5, 0.05)
+for _ in range(10): make_steps(5, 0.04)
+for _ in range(10): make_steps(5, 0.02)
+for _ in range(10): make_steps(5, 0.005)
 model.save('mpiotte-standard.model')
 # train()
 # predict()
-# nohup python3 -u  main.py   > playground_logs.out 2>&1 &
+# nohup python3 -u  main.py   > logs.out 2>&1 &
 # 34336
